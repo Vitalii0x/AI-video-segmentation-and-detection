@@ -8,18 +8,23 @@ import numpy as np
 from PIL import Image
 import plotly.graph_objects as go
 import plotly.express as px
+import traceback
 
 from video_processor import VideoProcessor
 from yolo_detector import YOLODetector
+from config import Config
 from utils import (
     create_output_directory, validate_video_file, get_supported_video_formats,
     format_time, plot_detection_statistics, create_interactive_plot,
-    save_detection_summary
+    save_detection_summary, setup_logging, get_system_info, get_memory_usage
 )
+
+# Setup logging
+setup_logging(Config.LOG_LEVEL)
 
 # Page configuration
 st.set_page_config(
-    page_title="Video Segmentation & Detection",
+    page_title=Config.APP_NAME,
     page_icon="🎥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -84,13 +89,7 @@ def main():
         
         # Model selection
         st.subheader("Model Settings")
-        model_options = {
-            "YOLOv8 Nano (Fast)": "yolov8n-seg.pt",
-            "YOLOv8 Small (Balanced)": "yolov8s-seg.pt", 
-            "YOLOv8 Medium (Accurate)": "yolov8m-seg.pt",
-            "YOLOv8 Large (Very Accurate)": "yolov8l-seg.pt",
-            "YOLOv8 XLarge (Most Accurate)": "yolov8x-seg.pt"
-        }
+        model_options = Config.SUPPORTED_MODELS
         
         selected_model = st.selectbox(
             "Select YOLO Model",
@@ -98,6 +97,25 @@ def main():
             index=0,
             help="Choose model based on speed vs accuracy trade-off"
         )
+        
+        # System Information
+        st.subheader("💻 System Info")
+        system_info = get_system_info()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("CPU Cores", system_info["cpu_count"])
+            st.metric("GPU", "Available" if system_info["gpu_available"] else "CPU Only")
+        
+        with col2:
+            memory_gb = system_info["memory_available"] / (1024**3)
+            st.metric("RAM Available", f"{memory_gb:.1f} GB")
+            if system_info["gpu_available"]:
+                st.metric("GPU Count", system_info["gpu_count"])
+        
+        # Memory Usage
+        memory_usage = get_memory_usage()
+        st.metric("Current Memory", f"{memory_usage['rss_mb']:.1f} MB")
         
         model_path = model_options[selected_model]
         

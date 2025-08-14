@@ -1,79 +1,114 @@
+import os
 import cv2
 import numpy as np
-import os
 import json
-from typing import List, Dict, Any, Tuple
+import time
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
+from loguru import logger
+import psutil
+from dotenv import load_dotenv
+from tqdm import tqdm
 
+# Load environment variables
+load_dotenv()
 
-def create_output_directory(base_path: str, create_subdirs: bool = True) -> str:
-    """
-    Create output directory with timestamp
-    
-    Args:
-        base_path: Base directory path
-        create_subdirs: Whether to create subdirectories
-        
-    Returns:
-        Path to created directory
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(base_path, f"output_{timestamp}")
-    
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    if create_subdirs:
-        subdirs = ['videos', 'frames', 'annotations', 'plots']
-        for subdir in subdirs:
-            subdir_path = os.path.join(output_dir, subdir)
-            if not os.path.exists(subdir_path):
-                os.makedirs(subdir_path)
-    
-    return output_dir
+# Configure logging
+logger.add("logs/app.log", rotation="10 MB", retention="7 days", level="INFO")
 
+def setup_logging(log_level: str = "INFO"):
+    """Setup logging configuration"""
+    logger.remove()
+    logger.add(
+        "logs/app.log",
+        rotation="10 MB",
+        retention="7 days",
+        level=log_level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+    )
+    logger.add(
+        lambda msg: print(msg, end=""),
+        level=log_level,
+        format="{time:HH:mm:ss} | {level} | {message}"
+    )
 
-def validate_video_file(video_path: str) -> bool:
-    """
-    Validate if video file exists and can be opened
+def get_system_info() -> Dict[str, Any]:
+    """Get system information for performance monitoring"""
+    try:
+        import torch
+        gpu_available = torch.cuda.is_available()
+        gpu_count = torch.cuda.device_count() if gpu_available else 0
+        gpu_name = torch.cuda.get_device_name(0) if gpu_available else "None"
+    except ImportError:
+        gpu_available = False
+        gpu_count = 0
+        gpu_name = "None"
     
-    Args:
-        video_path: Path to video file
-        
-    Returns:
-        True if valid, False otherwise
-    """
-    if not os.path.exists(video_path):
+    return {
+        "cpu_count": psutil.cpu_count(),
+        "memory_total": psutil.virtual_memory().total,
+        "memory_available": psutil.virtual_memory().available,
+        "gpu_available": gpu_available,
+        "gpu_count": gpu_count,
+        "gpu_name": gpu_name,
+        "python_version": f"{psutil.sys.version_info.major}.{psutil.sys.version_info.minor}.{psutil.sys.version_info.micro}"
+    }
+
+def create_output_directory(output_path: str) -> str:
+    """Create output directory if it doesn't exist"""
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created output directory: {output_dir}")
+    return str(output_dir)
+
+def validate_video_file(file_path: str) -> bool:
+    """Validate if file is a supported video format"""
+    if not os.path.exists(file_path):
+        logger.error(f"File does not exist: {file_path}")
         return False
     
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    # Check file extension
+    supported_formats = get_supported_video_formats()
+    file_ext = Path(file_path).suffix.lower()
+    
+    if file_ext not in supported_formats:
+        logger.error(f"Unsupported video format: {file_ext}")
         return False
     
-    cap.release()
-    return True
-
+    # Try to open with OpenCV
+    try:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.error(f"Could not open video file: {file_path}")
+            return False
+        cap.release()
+        logger.info(f"Video file validated successfully: {file_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error validating video file: {e}")
+        return False
 
 def get_supported_video_formats() -> List[str]:
     """Get list of supported video formats"""
-    return ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
-
+    return ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v']
 
 def format_time(seconds: float) -> str:
     """Format time in seconds to human readable format"""
     if seconds < 60:
         return f"{seconds:.1f}s"
     elif seconds < 3600:
-        minutes = seconds / 60
-        return f"{minutes:.1f}m"
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
     else:
-        hours = seconds / 3600
-        return f"{hours:.1f}h"
-
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
 
 def create_detection_heatmap(detections: List[Dict], frame_width: int, frame_height: int,
                            num_bins: int = 20) -> np.ndarray:
@@ -110,184 +145,109 @@ def create_detection_heatmap(detections: List[Dict], frame_width: int, frame_hei
     
     return heatmap
 
-
-def plot_detection_statistics(results: Dict[str, Any], save_path: str = None):
-    """
-    Create plots for detection statistics
+def plot_detection_statistics(detection_data: List[Dict[str, Any]], save_path: Optional[str] = None) -> go.Figure:
+    """Create interactive plot of detection statistics"""
+    if not detection_data:
+        logger.warning("No detection data provided for plotting")
+        return go.Figure()
     
-    Args:
-        results: Processing results
-        save_path: Path to save plots
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('Video Processing Statistics', fontsize=16)
+    # Extract data
+    frames = [d.get('frame', i) for i, d in enumerate(detection_data)]
+    detections = [len(d.get('detections', [])) for d in detection_data]
+    confidences = [np.mean([det.get('confidence', 0) for det in d.get('detections', [])]) if d.get('detections') else 0 for d in detection_data]
     
-    # Detection count over time
-    if 'annotations' in results:
-        frame_numbers = [ann['frame_number'] for ann in results['annotations']]
-        detection_counts = [len(ann['detections']) for ann in results['annotations']]
-        
-        axes[0, 0].plot(frame_numbers, detection_counts, 'b-', alpha=0.7)
-        axes[0, 0].set_title('Detections per Frame')
-        axes[0, 0].set_xlabel('Frame Number')
-        axes[0, 0].set_ylabel('Number of Detections')
-        axes[0, 0].grid(True, alpha=0.3)
-    
-    # Class distribution
-    if 'annotations' in results:
-        class_counts = {}
-        for ann in results['annotations']:
-            for det in ann['detections']:
-                class_name = det['class_name']
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
-        
-        if class_counts:
-            classes = list(class_counts.keys())
-            counts = list(class_counts.values())
-            
-            axes[0, 1].bar(classes, counts, color='skyblue', alpha=0.7)
-            axes[0, 1].set_title('Detection Count by Class')
-            axes[0, 1].set_xlabel('Class')
-            axes[0, 1].set_ylabel('Count')
-            axes[0, 1].tick_params(axis='x', rotation=45)
-    
-    # Processing time distribution
-    if 'annotations' in results:
-        timestamps = [ann['timestamp'] for ann in results['annotations']]
-        axes[1, 0].hist(timestamps, bins=20, color='lightgreen', alpha=0.7, edgecolor='black')
-        axes[1, 0].set_title('Detection Distribution Over Time')
-        axes[1, 0].set_xlabel('Time (seconds)')
-        axes[1, 0].set_ylabel('Frequency')
-        axes[1, 0].grid(True, alpha=0.3)
-    
-    # Summary statistics
-    summary_stats = [
-        f"Total Frames: {results['total_frames']}",
-        f"Processed: {results['processed_frames']}",
-        f"Total Detections: {results['total_detections']}",
-        f"Avg per Frame: {results['avg_detections_per_frame']:.2f}",
-        f"Processing Time: {format_time(results['total_processing_time'])}",
-        f"Avg Inference: {results['avg_inference_time']*1000:.1f}ms"
-    ]
-    
-    axes[1, 1].text(0.1, 0.9, '\n'.join(summary_stats), 
-                     transform=axes[1, 1].transAxes, fontsize=12,
-                     verticalalignment='top', fontfamily='monospace',
-                     bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-    axes[1, 1].set_title('Summary Statistics')
-    axes[1, 1].axis('off')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Statistics plot saved to: {save_path}")
-    
-    plt.show()
-
-
-def create_interactive_plot(results: Dict[str, Any], save_path: str = None):
-    """
-    Create interactive plot using Plotly
-    
-    Args:
-        results: Processing results
-        save_path: Path to save HTML plot
-    """
-    if 'annotations' not in results:
-        print("No annotations available for interactive plot")
-        return
-    
-    # Prepare data
-    frame_numbers = [ann['frame_number'] for ann in results['annotations']]
-    detection_counts = [len(ann['detections']) for ann in results['annotations']]
-    timestamps = [ann['timestamp'] for ann in results['annotations']]
-    
-    # Create figure
+    # Create subplots
     fig = go.Figure()
     
-    # Add detection count line
+    # Detection count over time
     fig.add_trace(go.Scatter(
-        x=frame_numbers,
-        y=detection_counts,
+        x=frames,
+        y=detections,
         mode='lines+markers',
-        name='Detections per Frame',
+        name='Detection Count',
         line=dict(color='blue', width=2),
-        marker=dict(size=4)
+        marker=dict(size=6)
     ))
     
-    # Add confidence scores if available
-    if results['annotations'] and results['annotations'][0]['detections']:
-        confidences = []
-        for ann in results['annotations']:
-            if ann['detections']:
-                avg_conf = np.mean([det['confidence'] for det in ann['detections']])
-                confidences.append(avg_conf)
-            else:
-                confidences.append(0)
-        
-        fig.add_trace(go.Scatter(
-            x=frame_numbers,
-            y=confidences,
-            mode='lines',
-            name='Average Confidence',
-            line=dict(color='red', width=2),
-            yaxis='y2'
-        ))
+    # Confidence over time
+    fig.add_trace(go.Scatter(
+        x=frames,
+        y=confidences,
+        mode='lines+markers',
+        name='Average Confidence',
+        yaxis='y2',
+        line=dict(color='red', width=2, dash='dash'),
+        marker=dict(size=6)
+    ))
     
-    # Update layout
     fig.update_layout(
-        title='Video Processing Analysis',
+        title='Detection Statistics Over Time',
         xaxis_title='Frame Number',
-        yaxis_title='Number of Detections',
-        yaxis2=dict(
-            title='Confidence Score',
-            overlaying='y',
-            side='right'
-        ),
+        yaxis=dict(title='Detection Count', side='left'),
+        yaxis2=dict(title='Average Confidence', side='right', overlaying='y'),
         hovermode='x unified',
         showlegend=True
     )
     
     if save_path:
         fig.write_html(save_path)
-        print(f"Interactive plot saved to: {save_path}")
+        logger.info(f"Detection statistics plot saved to: {save_path}")
     
-    fig.show()
+    return fig
 
-
-def save_detection_summary(results: Dict[str, Any], output_path: str):
-    """
-    Save detection summary to JSON file
+def create_interactive_plot(data: Dict[str, Any], plot_type: str = "bar") -> go.Figure:
+    """Create interactive plot based on data type"""
+    if plot_type == "bar":
+        fig = px.bar(
+            x=list(data.keys()),
+            y=list(data.values()),
+            title="Detection Results",
+            labels={'x': 'Category', 'y': 'Count'}
+        )
+    elif plot_type == "pie":
+        fig = px.pie(
+            values=list(data.values()),
+            names=list(data.keys()),
+            title="Detection Distribution"
+        )
+    else:
+        fig = px.line(
+            x=list(data.keys()),
+            y=list(data.values()),
+            title="Detection Trends"
+        )
     
-    Args:
-        results: Processing results
-        output_path: Path to save summary
-    """
+    fig.update_layout(
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    return fig
+
+def save_detection_summary(results: Dict[str, Any], output_path: str) -> str:
+    """Save detection summary to JSON file"""
     summary = {
-        'processing_info': {
-            'input_video': results['input_path'],
-            'output_video': results['output_path'],
-            'processing_date': datetime.now().isoformat(),
-            'model_info': results.get('model_info', {}),
-            'video_info': results['video_info']
-        },
-        'statistics': {
-            'total_frames': results['total_frames'],
-            'processed_frames': results['processed_frames'],
-            'total_detections': results['total_detections'],
-            'avg_detections_per_frame': results['avg_detections_per_frame'],
-            'total_processing_time': results['total_processing_time'],
-            'avg_inference_time': results['avg_inference_time'],
-            'avg_fps': results['avg_fps']
-        }
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model_used": results.get("model_info", {}).get("model_path", "Unknown"),
+        "processing_time": results.get("processing_time", 0),
+        "total_frames": results.get("total_frames", 0),
+        "total_detections": results.get("total_detections", 0),
+        "average_confidence": results.get("average_confidence", 0),
+        "detection_classes": results.get("detection_classes", {}),
+        "performance_metrics": results.get("performance_metrics", {})
     }
     
-    with open(output_path, 'w') as f:
+    # Ensure output directory exists
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save summary
+    summary_path = output_dir / "detection_summary.json"
+    with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     
-    print(f"Detection summary saved to: {output_path}")
-
+    logger.info(f"Detection summary saved to: {summary_path}")
+    return str(summary_path)
 
 def create_video_thumbnail(video_path: str, output_path: str, frame_number: int = 0):
     """
@@ -360,3 +320,51 @@ def resize_video_frame(frame: np.ndarray, target_width: int, target_height: int,
         return canvas
     else:
         return cv2.resize(frame, (target_width, target_height)) 
+
+def get_memory_usage() -> Dict[str, float]:
+    """Get current memory usage information"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    
+    return {
+        "rss_mb": memory_info.rss / 1024 / 1024,  # Resident Set Size in MB
+        "vms_mb": memory_info.vms / 1024 / 1024,  # Virtual Memory Size in MB
+        "percent": process.memory_percent()
+    }
+
+def optimize_video_settings(video_info: Dict[str, Any], target_fps: Optional[int] = None) -> Dict[str, Any]:
+    """Optimize video processing settings based on system capabilities"""
+    system_info = get_system_info()
+    memory_usage = get_memory_usage()
+    
+    # Calculate optimal batch size based on available memory
+    available_memory_gb = system_info["memory_available"] / 1024 / 1024 / 1024
+    optimal_batch_size = max(1, min(8, int(available_memory_gb / 2)))
+    
+    # Adjust FPS if needed
+    if target_fps and target_fps < video_info.get('fps', 30):
+        video_info['target_fps'] = target_fps
+        video_info['frame_skip'] = max(1, int(video_info.get('fps', 30) / target_fps))
+    else:
+        video_info['target_fps'] = video_info.get('fps', 30)
+        video_info['frame_skip'] = 1
+    
+    # Add optimization settings
+    video_info['optimization'] = {
+        'batch_size': optimal_batch_size,
+        'use_gpu': system_info['gpu_available'],
+        'memory_efficient': available_memory_gb < 8,
+        'frame_skip': video_info['frame_skip']
+    }
+    
+    logger.info(f"Video optimization settings: {video_info['optimization']}")
+    return video_info
+
+def create_progress_bar(total_frames: int, description: str = "Processing frames") -> tqdm:
+    """Create a progress bar with enhanced formatting"""
+    return tqdm(
+        total=total_frames,
+        desc=description,
+        unit="frames",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    ) 

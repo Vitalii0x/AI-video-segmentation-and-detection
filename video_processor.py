@@ -1,11 +1,15 @@
 import cv2
 import numpy as np
 import os
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from yolo_detector import YOLODetector
 import time
 from tqdm import tqdm
 import json
+from pathlib import Path
+from loguru import logger
+from config import Config
+from utils import get_system_info, get_memory_usage, optimize_video_settings, create_progress_bar
 
 
 class VideoProcessor:
@@ -13,16 +17,34 @@ class VideoProcessor:
     Main video processing class for YOLO-based detection and segmentation
     """
     
-    def __init__(self, model_path: str = "yolov8n-seg.pt", device: str = "auto"):
+    def __init__(self, model_path: str = None, device: str = None):
         """
         Initialize video processor
         
         Args:
-            model_path: Path to YOLO model
-            device: Device for inference
+            model_path: Path to YOLO model (uses default if None)
+            device: Device for inference (uses auto if None)
         """
-        self.detector = YOLODetector(model_path, device)
+        # Use configuration defaults if not specified
+        if model_path is None:
+            model_path = Config.DEFAULT_MODEL
+        if device is None:
+            device = Config.USE_GPU
+        
+        # Ensure model path is absolute
+        if not Path(model_path).is_absolute():
+            model_path = Config.get_model_path(model_path)
+        
+        try:
+            self.detector = YOLODetector(model_path, device)
+            logger.info(f"Initialized YOLO detector with model: {model_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize YOLO detector: {e}")
+            raise
+        
         self.video_info = {}
+        self.system_info = get_system_info()
+        logger.info(f"System info: {self.system_info}")
         
     def get_video_info(self, video_path: str) -> Dict[str, Any]:
         """
@@ -63,9 +85,9 @@ class VideoProcessor:
         return self.video_info
     
     def process_video(self, input_path: str, output_path: str, 
-                     conf_threshold: float = 0.25, iou_threshold: float = 0.45,
-                     draw_masks: bool = True, draw_boxes: bool = True,
-                     mask_alpha: float = 0.5, save_annotations: bool = False,
+                     conf_threshold: float = None, iou_threshold: float = None,
+                     draw_masks: bool = None, draw_boxes: bool = None,
+                     mask_alpha: float = None, save_annotations: bool = None,
                      progress_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         Process video with YOLO detection and segmentation
@@ -84,8 +106,22 @@ class VideoProcessor:
         Returns:
             Processing results and statistics
         """
+        # Use configuration defaults for missing parameters
+        settings = Config.get_processing_settings()
+        conf_threshold = conf_threshold if conf_threshold is not None else settings["confidence_threshold"]
+        iou_threshold = iou_threshold if iou_threshold is not None else settings["iou_threshold"]
+        draw_masks = draw_masks if draw_masks is not None else settings["draw_masks"]
+        draw_boxes = draw_boxes if draw_boxes is not None else settings["draw_boxes"]
+        mask_alpha = mask_alpha if mask_alpha is not None else settings["mask_alpha"]
+        save_annotations = save_annotations if save_annotations is not None else settings["save_annotations"]
+        
+        logger.info(f"Processing video with settings: conf={conf_threshold}, iou={iou_threshold}, masks={draw_masks}")
+        
         # Get video information
         video_info = self.get_video_info(input_path)
+        
+        # Optimize settings based on system capabilities
+        video_info = optimize_video_settings(video_info)
         
         # Open input video
         cap = cv2.VideoCapture(input_path)
